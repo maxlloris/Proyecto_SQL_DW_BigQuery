@@ -480,12 +480,42 @@ GROUP by bootcamp.bootcamp_id
 order by bootcamp.bootcamp_id
 
 
--- Informacion completa de alumnos:
--- ID, nombre, apellidos y correo electrónico.
--- Ranking basado en la duración total y el coste total de los bootcamps.
--- Número total de bootcamps, duración total en meses, e inversión económica total.
--- Lista de bootcamps, fechas de inicio, duraciones y fechas de finalización, todo concatenado y separado por ' / '.
--- Los resultados están ordenados por ranking en orden descendente.
+-- Student Academic & Investment Ranking Overview
+--
+-- Esta consulta genera una vista consolidada a nivel de alumno (1 fila por estudiante),
+-- integrando métricas académicas, económicas y temporales, junto con un ranking
+-- basado en el rendimiento formativo.
+--
+-- Métricas incluidas:
+-- • Identificación del alumno (ID, nombre, apellidos, email).
+-- • Ranking calculado mediante ROW_NUMBER(), priorizando:
+--     1) Mayor duración total acumulada de formación.
+--     2) Mayor inversión económica total.
+-- • Número total de bootcamps realizados.
+-- • Duración total acumulada (en meses).
+-- • Inversión económica total.
+-- • Lista concatenada de:
+--     - Bootcamps realizados.
+--     - Fechas de inicio.
+--     - Duraciones individuales.
+--     - Fechas de finalización calculadas dinámicamente.
+--
+-- Implementación técnica:
+-- • Se utilizan dos CTEs para separar responsabilidades:
+--     - student_cte: calcula el ranking agregando previamente duración e inversión.
+--     - bootcamp_dates_cte: construye el detalle temporal de cada inscripción.
+-- • El ranking se calcula mediante función ventana (ROW_NUMBER)
+--   sobre métricas agregadas por estudiante.
+-- • La fecha de finalización se obtiene sumando la duración (en meses)
+--   a la fecha de inicio utilizando INTERVAL.
+-- • STRING_AGG se emplea para consolidar información detallada en columnas únicas.
+--
+-- Grano de la consulta:
+-- • 1 fila = 1 estudiante.
+--
+-- Ordenación final:
+-- • Resultados ordenados por ranking en orden descendente
+--   (mayor duración total e inversión primero).
 WITH student_cte
 	AS(SELECT student.student_id AS student_id
 			, ROW_NUMBER() OVER(ORDER BY (SUM(bootcamp.duration))DESC, (SUM(bootcamp.price))DESC) AS rankin -- Genero rankin de duracion y de inversion economica
@@ -535,6 +565,105 @@ BY	 student.student_id
 	, student.email
 	, student_cte.rankin
 ORDER BY student_cte.rankin
+
+
+
+-- Bootcamp Performance Overview
+--
+-- Esta consulta genera una vista consolidada a nivel de bootcamp (1 fila por bootcamp),
+-- integrando métricas académicas y económicas a partir de múltiples relaciones 1:N.
+--
+-- Métricas incluidas:
+-- • Identificación básica del bootcamp (ID, nombre, precio, duración).
+-- • Número total de estudiantes inscritos.
+-- • Número total de profesores asignados.
+-- • Número total de asignaturas asociadas.
+-- • Listado concatenado de profesores.
+-- • Listado concatenado de asignaturas.
+-- • Revenue estimado calculado como (precio × número de estudiantes).
+--
+-- Implementación técnica:
+-- • Se utilizan CTEs para pre-agregar métricas en su grano natural (1 fila por bootcamp).
+-- • Esto evita la multiplicación de filas derivada de relaciones 1:N encadenadas.
+-- • Se emplea LEFT JOIN para mantener bootcamps sin relaciones asociadas.
+-- • COALESCE garantiza valores numéricos consistentes cuando no existen registros relacionados.
+--
+-- Ordenación final:
+-- • Resultados ordenados por bootcamp_id en orden ascendente.
+
+
+WITH students_per_bootcamp AS (
+    -- CTE 1: calculo métricas de estudiantes por bootcamp.
+    -- Grano (una fila) = 1 bootcamp_id.
+    SELECT
+        sb.bootcamp_id,
+        COUNT(*) AS n_students  -- Cuento inscripciones (filas) en student_bootcamp por bootcamp.
+    FROM public.student_bootcamp sb
+    GROUP BY sb.bootcamp_id
+),
+
+teachers_per_bootcamp AS (
+    -- CTE 2: calculo métricas de profesores por bootcamp.
+    -- Grano (una fila) = 1 bootcamp_id.
+    SELECT
+        bt.bootcamp_id,
+        COUNT(*) AS n_teachers,  -- Cuento asignaciones de profesor a bootcamp (filas en bootcamp_teacher).
+        STRING_AGG(CONCAT(t.name, ' ', t.surname),' | ' ORDER BY t.name) AS teacher_name  -- Construyo una lista de profesores del bootcamp en un solo texto.
+    FROM public.bootcamp_teacher bt
+    LEFT JOIN public.teacher t
+        ON t.teacher_id = bt.teacher_id  -- Relaciono cada asignación con los datos del profesor.
+    GROUP BY bt.bootcamp_id
+),
+
+subjects_per_bootcamp AS (
+    -- CTE 3: calculo métricas de asignaturas por bootcamp.
+    -- Grano (una fila) = 1 bootcamp_id.
+    SELECT 
+        bs.bootcamp_id,
+        COUNT(*) AS n_subjects,  -- Cuento relaciones bootcamp-asignatura (filas en bootcamp_subject).
+        STRING_AGG(DISTINCT s.name,' | 'ORDER BY s.name) AS subject_name  -- Lista de asignaturas del bootcamp (DISTINCT para evitar duplicados).
+    FROM public.bootcamp_subject bs
+    LEFT JOIN public.subject s
+        ON s.subject_id = bs.subject_id  -- Relaciono cada relación con el nombre de la asignatura.
+    GROUP BY bs.bootcamp_id
+)
+
+-- Query final: devuelvo 1 fila por bootcamp con sus métricas ya agregadas.
+SELECT
+    b.bootcamp_id,
+    b.name,
+    b.price,
+    b.duration,
+
+    -- Si un bootcamp no tiene filas en la CTE, el LEFT JOIN produce NULL; COALESCE lo convierte a 0.
+    COALESCE(spb.n_students, 0) AS n_students,
+    COALESCE(tpb.n_teachers, 0) AS n_teachers,
+    COALESCE(subpb.n_subjects, 0) AS n_subjects,
+
+    -- Listas de profesores y asignaturas (pueden ser NULL si no hay relaciones).
+    tpb.teacher_name,
+    subpb.subject_name,
+
+    -- Ingresos teóricos: precio del bootcamp * número de estudiantes inscritos.
+    (b.price * COALESCE(spb.n_students, 0)) AS revenue
+
+FROM public.bootcamp b
+
+-- Uno cada bootcamp con su CTE de estudiantes (1:1 por bootcamp_id).
+LEFT JOIN students_per_bootcamp spb
+    ON spb.bootcamp_id = b.bootcamp_id
+
+-- Uno cada bootcamp con su CTE de profesores (1:1 por bootcamp_id).
+LEFT JOIN teachers_per_bootcamp tpb
+    ON tpb.bootcamp_id = b.bootcamp_id
+
+-- Uno cada bootcamp con su CTE de asignaturas (1:1 por bootcamp_id).
+LEFT JOIN subjects_per_bootcamp subpb
+    ON subpb.bootcamp_id = b.bootcamp_id
+
+-- Ordeno por id de bootcamp para tener una salida estable y fácil de leer.
+ORDER BY b.bootcamp_id;
+
 
 
 -- Listado de todas los bootcamps y sus asignaturas.
